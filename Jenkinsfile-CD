@@ -1,0 +1,153 @@
+def paramsList = load 'scripts/pipelineParams.groovy'
+
+properties([
+    parameters(paramsList)
+])
+
+def validateInputs() {
+    if (!params.IMAGE_TAG?.trim()) error("❌ IMAGE_TAG is required")
+    if (!params.ECR_REPO?.trim()) error("❌ ECR_REPO is required")
+    if (!params.JIRA_TICKET_ID?.trim()) error("❌ JIRA_TICKET_ID is required")
+}
+
+pipeline {  
+    agent any
+
+    environment {
+        APP_NAME     = "my-app"
+        COLOR        = "green"
+        NAMESPACE    = "${APP_NAME}-${params.ENVIRONMENT}"
+        RELEASE_NAME = "${APP_NAME}-${params.ENVIRONMENT}-${COLOR}"
+        VALUES_FILE  = "values-${COLOR}.yaml"
+    }
+
+    stages {
+
+        stage('🧪 Validate Inputs') {
+            steps {
+                script {
+                    validateInputs()
+                    echo "✅ Input validation passed"
+                }
+            }
+        }
+
+        stage('🔐 Fetch Secrets from AWS Secrets Manager') {
+            steps {
+                script {
+                    def dbSecret = sh(
+                        script: """
+                            aws secretsmanager get-secret-value \
+                                --secret-id myapp/${params.ENVIRONMENT}/db-creds \
+                                --query SecretString --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def secretJson = readJSON text: dbSecret
+                    env.DB_USER = secretJson.username
+                    env.DB_PASS = secretJson.password
+                    echo "🔐 Secrets fetched successfully"
+                }
+            }
+        }
+
+        stage('🧹 Clean Old Configs') {
+            steps {
+                script {
+                    sh """
+                        kubectl delete configmap ${APP_NAME}-config --ignore-not-found -n ${NAMESPACE}
+                        kubectl delete secret ${APP_NAME}-secret --ignore-not-found -n ${NAMESPACE}
+                    """
+                }
+            }
+        }
+
+        stage('📝 Generate values.yaml') {
+            steps {
+                script {
+                    def valuesYaml = """
+                    image:
+                      repository: ${params.ECR_REPO}
+                      tag: "${params.IMAGE_TAG}"
+                    namespace: ${NAMESPACE}
+                    appName: ${APP_NAME}
+                    ingress:
+                      enabled: true
+                      host: ${APP_NAME}.${params.ENVIRONMENT}.mycorp.com
+                    db:
+                      user: "${env.DB_USER}"
+                      password: "${env.DB_PASS}"
+                    """
+
+                    writeFile file: "${VALUES_FILE}", text: valuesYaml
+                    echo "✅ Helm values.yaml generated"
+                }
+            }
+        }
+
+        stage('🚀 Helm Deploy (with Rollback)') {
+            steps {
+                script {
+                    try {
+                        sh """
+                            helm upgrade --install ${RELEASE_NAME} ./helm/${APP_NAME} \
+                                --namespace ${NAMESPACE} \
+                                --create-namespace \
+                                -f ${VALUES_FILE}
+                        """
+                        echo "✅ Helm deploy succeeded"
+                    } catch (e) {
+                        echo "❌ Helm deploy failed. Attempting rollback..."
+                        sh "helm rollback ${RELEASE_NAME}"
+                        error("Deployment failed and rollback executed")
+                    }
+                }
+            }
+        }
+
+        stage('🔁 Switch Service Traffic') {
+            steps {
+                script {
+                    sh """
+                        kubectl patch service ${APP_NAME}-svc \
+                            -n ${NAMESPACE} \
+                            -p '{"spec":{"selector":{"release":"${RELEASE_NAME}"}}}'
+                    """
+                }
+            }
+        }
+
+        stage('🌐 Recreate Ingress') {
+            steps {
+                script {
+                    sh """
+                        kubectl delete ingress ${APP_NAME}-ingress -n ${NAMESPACE} --ignore-not-found
+                        kubectl apply -f helm/${APP_NAME}/templates/ingress.yaml -n ${NAMESPACE}
+                    """
+                }
+            }
+        }
+
+        stage('🔍 Verify & Notify') {
+            steps {
+                script {
+                    sh "kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE}"
+                    echo "✅ Deployment verified"
+
+                    // Placeholder: Jira update
+                    // sh """curl -X POST -H "Authorization: Bearer $JIRA_TOKEN" ..."""
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Deployment completed successfully"
+        }
+        failure {
+            echo "❌ Deployment failed. Rollback was attempted"
+        }
+    }
+}
